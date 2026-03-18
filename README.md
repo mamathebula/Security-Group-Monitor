@@ -1,8 +1,8 @@
-# Security Group Monitor
+# Security Group Monitor™ - Standalone Edition
 
 Automated AWS Security Group compliance monitoring and remediation. Detects and automatically revokes open CIDR rules (0.0.0.0/0 and ::/0) in real-time.
 
-Available on AWS Marketplace as a CloudFormation template with AMI-based licensing.
+This is the standalone (non-Marketplace) version. It is 100% serverless — no EC2 instances required.
 
 ---
 
@@ -23,38 +23,31 @@ Available on AWS Marketplace as a CloudFormation template with AMI-based licensi
 ┌──────────────────────────────────────────────────────────────┐
 │                    AWS Account                                │
 │                                                              │
-│  ┌─────────────┐    ┌──────────────┐    ┌───────────────┐   │
-│  │ EC2 License  │    │  CloudTrail   │    │  EventBridge   │   │
-│  │ Server       │    │  (API Events) │───▶│  (Rules)       │   │
-│  │ (Billing)    │    └──────────────┘    └───────┬───────┘   │
-│  └─────────────┘                                 │           │
-│                                                  ▼           │
-│                                         ┌───────────────┐   │
-│                                         │    Lambda      │   │
-│                                         │  (Monitor &    │   │
-│                                         │   Remediate)   │   │
-│                                         └───────┬───────┘   │
-│                                                  │           │
-│                              ┌───────────────────┼──────┐   │
-│                              ▼                   ▼      │   │
-│                     ┌──────────────┐    ┌────────────┐  │   │
-│                     │  SNS (Email   │    │ EC2 API    │  │   │
-│                     │  Alerts)      │    │ (Revoke    │  │   │
-│                     └──────────────┘    │  Rules)    │  │   │
-│                                         └────────────┘  │   │
+│  ┌──────────────┐    ┌──────────────┐    ┌───────────────┐  │
+│  │  CloudTrail   │    │  EventBridge  │    │    Lambda     │  │
+│  │  (Captures    │───▶│  (Detects SG  │───▶│  (Scans &    │  │
+│  │   API calls)  │    │   changes)    │    │   Remediates) │  │
+│  └──────────────┘    └──────────────┘    └───────┬───────┘  │
+│                                                   │          │
+│                                    ┌──────────────┼─────┐   │
+│                                    ▼              ▼     │   │
+│                           ┌──────────────┐  ┌────────┐  │   │
+│                           │  SNS (Email   │  │ EC2 API│  │   │
+│                           │  Alerts)      │  │(Revoke)│  │   │
+│                           └──────────────┘  └────────┘  │   │
 │                                                         │   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### How It Works
+### Flow
 
-1. A user creates or modifies a security group
+1. User creates or modifies a security group
 2. CloudTrail captures the API call
-3. EventBridge detects the event and triggers the Lambda function
-4. Lambda inspects the security group for open CIDR rules (0.0.0.0/0 or ::/0)
+3. EventBridge detects the event and triggers Lambda
+4. Lambda inspects the security group for open CIDR rules
 5. If violations found:
    - Sends email alert via SNS
-   - Automatically revokes the open rules (if auto-remediate is enabled)
+   - Automatically revokes the open rules (if auto-remediate enabled)
 6. If security group has tag `Name=testing`, it is whitelisted and skipped
 
 ### Monitored Events
@@ -71,33 +64,35 @@ Available on AWS Marketplace as a CloudFormation template with AMI-based licensi
 
 ### Prerequisites
 
-- AWS Account with appropriate permissions
+- AWS Account
 - Valid email address for alerts
-- VPC and Subnet for the license server
-- AWS Marketplace subscription (for Marketplace version)
+- CloudFormation permissions
 
 ### Parameters
 
 | Parameter | Description | Default | Required |
 |-----------|-------------|---------|----------|
-| ImageId | AMI ID for license server | - | Yes |
-| VpcId | VPC for license server | - | Yes |
-| SubnetId | Subnet for license server | - | Yes |
-| KeyName | SSH Key Pair (optional) | - | No |
-| InstanceType | License server instance type | t3.micro | Yes |
 | AdminEmail | Email for security alerts | - | Yes |
 | AutoRemediate | Auto-revoke open rules | true | Yes |
 | RunInitialScan | Scan existing security groups on deploy | true | Yes |
 
 ### Deploy via AWS Console
 
-1. Go to AWS CloudFormation Console
-2. Click "Create stack" → "With new resources"
-3. Upload `security-group-monitor-marketplace.yaml`
-4. Fill in parameters
-5. Click "Next" → "Next" → Check "I acknowledge..." → "Submit"
-6. Wait for stack to reach "CREATE_COMPLETE"
-7. Confirm the SNS email subscription (check your inbox)
+1. Go to CloudFormation Console: https://console.aws.amazon.com/cloudformation
+2. Click "Create stack" → "With new resources (standard)"
+3. Select "Upload a template file"
+4. Upload `security-group-monitor.yaml`
+5. Click "Next"
+6. Fill in:
+   - Stack name: `security-group-monitor` (or any name)
+   - AdminEmail: Your email address
+   - AutoRemediate: `true` (recommended)
+   - RunInitialScan: `true` (recommended)
+7. Click "Next" → "Next"
+8. Check "I acknowledge that AWS CloudFormation might create IAM resources with custom names"
+9. Click "Submit"
+10. Wait for stack to reach "CREATE_COMPLETE"
+11. Check your email and confirm the SNS subscription
 
 ---
 
@@ -105,22 +100,19 @@ Available on AWS Marketplace as a CloudFormation template with AMI-based licensi
 
 | Resource | Type | Purpose |
 |----------|------|---------|
-| LicenseServer | EC2 Instance | AWS Marketplace billing/licensing |
-| LicenseServerSecurityGroup | Security Group | Network access for license server |
-| LicenseServerRole | IAM Role | Permissions for license server |
-| LicenseServerInstanceProfile | Instance Profile | Attaches role to EC2 |
 | SecurityGroupMonitorFunction | Lambda Function | Real-time monitoring & remediation |
-| InitialScanFunction | Lambda Function | Scans all existing security groups |
-| TriggerInitialScanFunction | Lambda Function | Triggers initial scan on deploy |
-| SecurityMonitorRole | IAM Role | Permissions for Lambda functions |
+| InitialScanFunction | Lambda Function | Scans all existing security groups on deploy |
+| TriggerInitialScanFunction | Lambda Function | Triggers initial scan (CloudFormation custom resource) |
+| SecurityMonitorRole | IAM Role | Permissions for monitoring Lambda |
 | TriggerScanRole | IAM Role | Permissions for trigger Lambda |
 | SecurityAlertTopic | SNS Topic | Email alert notifications |
 | SecurityGroupEventRule | EventBridge Rule | Triggers Lambda on SG changes |
 | SecurityMonitorTrail | CloudTrail | Captures API events |
-| TrailBucket | S3 Bucket | Stores CloudTrail logs |
-| SecurityMonitorLogGroup | CloudWatch Logs | Lambda function logs |
-| InitialScanLogGroup | CloudWatch Logs | Initial scan logs |
-| TriggerScanLogGroup | CloudWatch Logs | Trigger function logs |
+| TrailBucket | S3 Bucket | Stores CloudTrail logs (7-day retention) |
+| TrailBucketPolicy | S3 Bucket Policy | Allows CloudTrail to write logs |
+| SecurityMonitorLogGroup | CloudWatch Logs | Main Lambda logs (7-day retention) |
+| InitialScanLogGroup | CloudWatch Logs | Initial scan logs (7-day retention) |
+| TriggerScanLogGroup | CloudWatch Logs | Trigger function logs (7-day retention) |
 
 All resources are tagged with:
 - `Name=do-not-delete`
@@ -132,18 +124,18 @@ All resources are tagged with:
 ## Features
 
 ### Auto-Remediation
-When enabled, the Lambda function automatically revokes any ingress rule that allows traffic from 0.0.0.0/0 or ::/0. This happens in real-time within seconds of the rule being created.
+When enabled, Lambda automatically revokes any ingress rule allowing traffic from 0.0.0.0/0 or ::/0. Happens in real-time within seconds of the rule being created.
 
 ### Tag-Based Whitelisting
-Tag any security group with `Name=testing` (case-insensitive) to exclude it from monitoring and remediation. Useful for development and testing environments.
+Tag any security group with `Name=testing` (case-insensitive) to exclude it from monitoring and remediation.
 
-If the `Name=testing` tag is removed from a whitelisted security group, the monitor will re-scan it and remediate any open rules.
+If the `Name=testing` tag is later removed, the monitor re-scans that security group and remediates any open rules.
 
 ### Initial Scan
-On deployment, the template can run an initial scan of all existing security groups in the account. This catches any pre-existing violations that were created before the monitor was deployed.
+On deployment, scans all existing security groups in the account using pagination. Catches pre-existing violations created before the monitor was deployed.
 
 ### Email Alerts
-All violations trigger email notifications via SNS. Alerts include:
+All violations trigger email notifications. Alerts include:
 - Security group ID and name
 - VPC ID
 - Open rules detected (protocol, ports, CIDR)
@@ -151,118 +143,124 @@ All violations trigger email notifications via SNS. Alerts include:
 
 ---
 
-## Alert Examples
+## Estimated Monthly Cost
 
-### Violation Detected and Remediated
-```
-Security Group Compliance Alert
-================================
-Timestamp: 2026-03-18 14:30:00 UTC
-Action: REMEDIATED
-Total Violations: 1
+| Service | Monthly Cost | Notes |
+|---------|--------------|-------|
+| S3 (CloudTrail logs) | ~$0.50 | 7-day lifecycle |
+| CloudWatch Logs | ~$0.10 | 7-day retention |
+| Lambda | $0.00 | Free tier |
+| CloudTrail | $0.00 | First trail free |
+| SNS | $0.00 | First 1,000 emails free |
+| EventBridge | $0.00 | Free for AWS events |
+| **Total** | **~$0.60/month** | |
 
-Details:
---------
-1. Security Group: web-server-sg (sg-0123456789abcdef0)
-   VPC: vpc-0123456789abcdef0
-   Open Rules Detected:
-     - Protocol: tcp, Ports: 22-22, CIDR: 0.0.0.0/0
-   ✅ Status: OPEN RULES REVOKED
-```
-
-### Whitelisted Security Group
-```
-Security Group Compliance Alert
-================================
-Timestamp: 2026-03-18 14:30:00 UTC
-Action: DETECTED (Whitelisted)
-Total Violations: 1
-
-Details:
---------
-1. Security Group: test-sg (sg-0123456789abcdef0)
-   VPC: vpc-0123456789abcdef0
-   Open Rules Detected:
-     - Protocol: -1, Ports: All-All, CIDR: 0.0.0.0/0
-   ⚪ Status: WHITELISTED (Tag: Name=testing) - Not remediated
-```
+This is a fully serverless solution — no EC2 instances, no ongoing compute costs.
 
 ---
 
-## Estimated Monthly Cost
+## Differences from Marketplace Edition
 
-| Instance Type | EC2 Cost | Other Services | Total |
-|---------------|----------|----------------|-------|
-| t3.nano | $3.80 | $1.34 | $5.14 |
-| t3.micro | $7.59 | $1.34 | $8.93 |
-| t3.medium | $30.37 | $1.34 | $31.71 |
+| Feature | Standalone (This) | Marketplace Edition |
+|---------|-------------------|---------------------|
+| EC2 Instance | None | Required (license server) |
+| Monthly Cost | ~$0.60 | ~$5.14+ |
+| AWS Marketplace | Not listed | Listed for sale |
+| Billing | Free (self-deploy) | Paid subscription |
+| VPC/Subnet Required | No | Yes (for EC2) |
+| Parameters | 3 | 8 |
 
-Other services include: S3 (~$0.50), EBS (~$0.64), CloudWatch Logs (~$0.10), Lambda ($0.00 free tier), SNS ($0.00 free tier), EventBridge ($0.00), CloudTrail ($0.00 first trail).
-
-See `COST_BREAKDOWN.md` for detailed cost analysis.
+Use this standalone version for personal/internal use. Use the Marketplace edition (`security-group-monitor-marketplace.yaml`) for commercial distribution.
 
 ---
 
 ## Cleanup / Deletion
 
-### Quick Method (Console)
-1. Go to S3 Console → Empty the `security-monitor-trail-*` bucket
-2. Go to CloudFormation Console → Select stack → Delete
+### Via Console
 
-### If Deletion Fails
-See `CONSOLE_CLEANUP_GUIDE.md` for step-by-step manual cleanup instructions.
+1. **Empty the S3 bucket first:**
+   - Go to S3 Console: https://console.aws.amazon.com/s3
+   - Find bucket: `security-monitor-trail-[ACCOUNT-ID]-[REGION]`
+   - Click "Empty" → Type `permanently delete` → Click "Empty"
 
----
-
-## Important Notes
-
-### EC2 Instance Must Keep Running
-The EC2 license server is required by AWS Marketplace for billing. Do NOT stop or terminate it. See `EC2_INSTANCE_REQUIREMENT.md` for details.
-
-### CloudTrail Requirement
-The template creates a CloudTrail trail to capture security group API events. This is required for EventBridge to detect changes in real-time.
-
-### S3 Bucket Lifecycle
-CloudTrail logs in S3 are automatically deleted after 7 days to minimize storage costs.
-
-### CloudWatch Log Retention
-All log groups have 7-day retention to minimize costs.
+2. **Delete the CloudFormation stack:**
+   - Go to CloudFormation Console: https://console.aws.amazon.com/cloudformation
+   - Select your stack → Click "Delete" → Confirm
 
 ---
 
-## Files in This Repository
+## Testing
 
-| File | Description |
-|------|-------------|
-| `security-group-monitor-marketplace.yaml` | Main CloudFormation template (use this) |
-| `security-group-monitor.yaml` | Original standalone version (no Marketplace) |
-| `README.md` | This file |
-| `MARKETPLACE_DEPLOYMENT_GUIDE.md` | Step-by-step Marketplace submission guide |
-| `MARKETPLACE_METADATA_GUIDE.md` | Required metadata for Marketplace listing |
-| `AMI_SETUP_INSTRUCTIONS.md` | How to create and configure the AMI |
-| `COST_BREAKDOWN.md` | Detailed cost analysis and pricing strategy |
-| `CONSOLE_CLEANUP_GUIDE.md` | How to delete all resources (console only) |
-| `EC2_INSTANCE_REQUIREMENT.md` | Why the EC2 instance must keep running |
-| `DELETION_PROTECTION_GUIDE.md` | Resource protection information |
-| `MARKETPLACE_TEMPLATE_CHANGES.md` | Changes made for Marketplace compatibility |
-| `security-group-monitor-architecture.md` | Architecture documentation |
+### Test 1: Create an Open Security Group
+
+1. Go to EC2 Console → Security Groups → Create Security Group
+2. Add inbound rule: Type=All Traffic, Source=0.0.0.0/0
+3. Save
+4. Within seconds:
+   - You should receive an email alert
+   - The open rule should be automatically revoked (if auto-remediate is on)
+
+### Test 2: Whitelist a Security Group
+
+1. Create a security group
+2. Add tag: Key=`Name`, Value=`testing`
+3. Add inbound rule: Type=All Traffic, Source=0.0.0.0/0
+4. You should receive an alert, but the rule should NOT be revoked
+5. Remove the `Name=testing` tag
+6. The monitor re-scans and revokes the open rule
+
+### Test 3: Manual Lambda Invocation
+
+1. Go to Lambda Console
+2. Find `SecurityGroupMonitorFunction`
+3. Click "Test"
+4. Use empty event: `{}`
+5. This triggers a full scan of all security groups
 
 ---
 
-## Support
+## Outputs
 
-For issues or questions:
-- Check CloudWatch Logs for Lambda function errors
-- Verify SNS email subscription is confirmed
-- Ensure CloudTrail is logging (check trail status)
-- Verify EventBridge rule is enabled
+After deployment, CloudFormation provides these outputs:
+
+| Output | Description |
+|--------|-------------|
+| LambdaFunctionArn | ARN of the monitoring Lambda function |
+| SNSTopicArn | ARN of the SNS alert topic |
+| CloudTrailName | Name of the CloudTrail trail |
+| TrailBucketName | Name of the S3 bucket for logs |
+| InitialScanFunctionArn | ARN of the initial scan Lambda (if enabled) |
+
+---
+
+## Troubleshooting
+
+### Not Receiving Email Alerts
+- Check your email for the SNS subscription confirmation
+- Look in spam/junk folder
+- Verify the email address in CloudFormation parameters
+
+### Rules Not Being Revoked
+- Check `AutoRemediate` parameter is set to `true`
+- Check if the security group has `Name=testing` tag (whitelisted)
+- Check Lambda CloudWatch Logs for errors
+
+### EventBridge Not Triggering
+- Verify CloudTrail is logging (check trail status)
+- Ensure EventBridge rule is enabled
+- Check Lambda permissions
+
+### Initial Scan Didn't Run
+- Verify `RunInitialScan` parameter is set to `true`
+- Check TriggerInitialScanFunction CloudWatch Logs
+- Check InitialScanFunction CloudWatch Logs
 
 ---
 
 ## Support & Contact
 
-- **Email:** [email]
-- **WhatsApp:** [phone_number]
+- **Email:** [mathebula000@gmail.com]
+- **WhatsApp:** [+27797749367]
 
 For issues, feature requests, or general inquiries, reach out via email or WhatsApp.
 
@@ -273,5 +271,3 @@ For issues, feature requests, or general inquiries, reach out via email or Whats
 © 2026 Security Group Monitor™. All rights reserved.
 
 Security Group Monitor is a trademark. Unauthorized reproduction, distribution, or modification of this software is strictly prohibited.
-
-Available through AWS Marketplace.
