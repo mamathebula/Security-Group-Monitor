@@ -1,0 +1,800 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Group Monitor - Detects and removes security groups open to the world (Multi-Region)'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Configuration"
+        Parameters:
+          - AdminEmail
+          - AutoRemediate
+          - RunInitialScan
+
+Parameters:
+  AdminEmail:
+    Type: String
+    Description: Email address for security alerts
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+  
+  AutoRemediate:
+    Type: String
+    Description: Automatically revoke open CIDR rules (0.0.0.0/0 and ::/0)
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  RunInitialScan:
+    Type: String
+    Description: Run initial scan on deployment to check existing security groups
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Resources:
+  # SNS Topic for Alerts
+  SecurityAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Security Group Compliance Alerts
+      Subscription:
+        - Endpoint: !Ref AdminEmail
+          Protocol: email
+      Tags:
+        - Key: Name
+          Value: do-not-delete
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: SecurityGroupMonitoring
+
+  # IAM Role for Lambda
+  SecurityMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'SecurityGroupMonitorRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecurityGroupMonitorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSecurityGroupRules
+                  - ec2:DescribeTags
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertTopic
+
+  # Lambda Function
+  SecurityGroupMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityMonitorRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityAlertTopic
+          AUTO_REMEDIATE: !Ref AutoRemediate
+      Tags:
+        - Key: Name
+          Value: do-not-delete
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: SecurityGroupMonitoring
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+
+          ec2 = boto3.client('ec2')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              auto_remediate = os.environ['AUTO_REMEDIATE'].lower() == 'true'
+              
+              violations = []
+              
+              try:
+                  # If this is a DeleteTags event, check if it's for the Name=testing tag
+                  if 'detail' in event and event['detail'].get('eventName') == 'DeleteTags':
+                      request_params = event['detail'].get('requestParameters', {})
+                      tag_set = request_params.get('tagSet', {}).get('items', [])
+                      
+                      # Check if Name=testing tag was deleted (case-insensitive)
+                      name_testing_deleted = False
+                      for tag in tag_set:
+                          if tag.get('key', '').lower() == 'name' and tag.get('value', '').lower() == 'testing':
+                              name_testing_deleted = True
+                              break
+                      
+                      # If Name=testing wasn't deleted, exit early
+                      if not name_testing_deleted:
+                          print("DeleteTags event but not for Name=testing tag, skipping scan")
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({'message': 'Not a whitelist tag deletion, skipping'})
+                          }
+                  
+                  # Extract security group ID from CloudTrail event
+                  sg_id = None
+                  if 'detail' in event:
+                      detail = event['detail']
+                      request_params = detail.get('requestParameters', {})
+                      
+                      # Handle different event types
+                      if 'groupId' in request_params:
+                          sg_id = request_params['groupId']
+                      elif 'groupSet' in request_params:
+                          items = request_params['groupSet'].get('items', [])
+                          if items:
+                              sg_id = items[0].get('groupId')
+                      elif 'resourcesSet' in request_params:
+                          # For tag operations
+                          items = request_params['resourcesSet'].get('items', [])
+                          if items:
+                              resource_id = items[0].get('resourceId', '')
+                              if resource_id.startswith('sg-'):
+                                  sg_id = resource_id
+                  
+                  # If triggered by event, check specific SG; otherwise scan all
+                  if sg_id:
+                      response = ec2.describe_security_groups(GroupIds=[sg_id])
+                  else:
+                      response = ec2.describe_security_groups()
+                  
+                  for sg in response['SecurityGroups']:
+                      sg_id = sg['GroupId']
+                      sg_name = sg['GroupName']
+                      vpc_id = sg.get('VpcId', 'EC2-Classic')
+                      
+                      # Check if SG is whitelisted via tag (case-insensitive)
+                      is_whitelisted = False
+                      for tag in sg.get('Tags', []):
+                          if tag.get('Key', '').lower() == 'name' and tag.get('Value', '').lower() == 'testing':
+                              is_whitelisted = True
+                              break
+                      
+                      # Check for open ingress rules and revoke them
+                      rules_to_revoke = []
+                      revoked_rules = []
+                      
+                      for rule in sg.get('IpPermissions', []):
+                          has_open_cidr = False
+                          rule_copy = rule.copy()
+                          
+                          # Check for 0.0.0.0/0
+                          open_ipv4 = [ip for ip in rule.get('IpRanges', []) if ip.get('CidrIp') == '0.0.0.0/0']
+                          # Check for ::/0
+                          open_ipv6 = [ip for ip in rule.get('Ipv6Ranges', []) if ip.get('CidrIpv6') == '::/0']
+                          
+                          if open_ipv4 or open_ipv6:
+                              has_open_cidr = True
+                              from_port = rule.get('FromPort', 'All')
+                              to_port = rule.get('ToPort', 'All')
+                              protocol = rule.get('IpProtocol', 'All')
+                              
+                              # Build rule to revoke (only the open CIDRs)
+                              revoke_rule = {
+                                  'IpProtocol': rule.get('IpProtocol', '-1')
+                              }
+                              
+                              if 'FromPort' in rule:
+                                  revoke_rule['FromPort'] = rule['FromPort']
+                              if 'ToPort' in rule:
+                                  revoke_rule['ToPort'] = rule['ToPort']
+                              
+                              if open_ipv4:
+                                  revoke_rule['IpRanges'] = open_ipv4
+                              if open_ipv6:
+                                  revoke_rule['Ipv6Ranges'] = open_ipv6
+                              
+                              rules_to_revoke.append(revoke_rule)
+                              
+                              # Track for reporting
+                              for ip in open_ipv4:
+                                  revoked_rules.append({
+                                      'Protocol': protocol,
+                                      'FromPort': from_port,
+                                      'ToPort': to_port,
+                                      'CIDR': '0.0.0.0/0'
+                                  })
+                              
+                              for ip in open_ipv6:
+                                  revoked_rules.append({
+                                      'Protocol': protocol,
+                                      'FromPort': from_port,
+                                      'ToPort': to_port,
+                                      'CIDR': '::/0'
+                                  })
+                      
+                      if revoked_rules:
+                          violation = {
+                              'SecurityGroupId': sg_id,
+                              'SecurityGroupName': sg_name,
+                              'VpcId': vpc_id,
+                              'OpenRules': revoked_rules,
+                              'Remediated': False,
+                              'Whitelisted': is_whitelisted
+                          }
+                          
+                          # Attempt to revoke open rules if auto-remediate is enabled AND not whitelisted
+                          if auto_remediate and rules_to_revoke and not is_whitelisted:
+                              try:
+                                  ec2.revoke_security_group_ingress(
+                                      GroupId=sg_id,
+                                      IpPermissions=rules_to_revoke
+                                  )
+                                  violation['Remediated'] = True
+                                  print(f"Revoked open rules from security group: {sg_id}")
+                              except Exception as e:
+                                  violation['RemediationError'] = str(e)
+                                  print(f"Failed to revoke rules from {sg_id}: {str(e)}")
+                          elif is_whitelisted:
+                              print(f"Skipping whitelisted security group: {sg_id}")
+                          
+                          violations.append(violation)
+                  
+                  # Send SNS notification if violations found
+                  if violations:
+                      message = format_alert_message(violations, auto_remediate)
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject='🚨 Security Alert: Open CIDR Rules Detected',
+                          Message=message
+                      )
+                      print(f"Alert sent for {len(violations)} violations")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Scan complete. Found {len(violations)} violations.',
+                          'violations': violations
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Error during security group scan: {str(e)}"
+                  print(error_message)
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject='❌ Security Monitor Error',
+                      Message=error_message
+                  )
+                  raise
+
+          def format_alert_message(violations, auto_remediate):
+              timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+              
+              # Determine actual action based on what happened
+              remediated_count = sum(1 for v in violations if v.get('Remediated'))
+              whitelisted_count = sum(1 for v in violations if v.get('Whitelisted'))
+              
+              if remediated_count > 0 and whitelisted_count > 0:
+                  action = "MIXED (Some remediated, some whitelisted)"
+              elif remediated_count > 0:
+                  action = "REMEDIATED"
+              elif whitelisted_count > 0:
+                  action = "DETECTED (Whitelisted)"
+              elif auto_remediate:
+                  action = "DETECTED (Remediation failed)"
+              else:
+                  action = "DETECTED (Auto-remediation disabled)"
+              
+              message = f"""
+          Security Group Compliance Alert
+          ================================
+          Timestamp: {timestamp}
+          Action: {action}
+          Total Violations: {len(violations)}
+
+          Details:
+          --------
+          """
+              
+              for i, v in enumerate(violations, 1):
+                  message += f"\n{i}. Security Group: {v['SecurityGroupName']} ({v['SecurityGroupId']})\n"
+                  message += f"   VPC: {v['VpcId']}\n"
+                  message += f"   Open Rules Detected:\n"
+                  
+                  for rule in v['OpenRules']:
+                      protocol = rule['Protocol']
+                      from_port = rule.get('FromPort', 'All')
+                      to_port = rule.get('ToPort', 'All')
+                      cidr = rule.get('CIDR', '0.0.0.0/0')
+                      message += f"     - Protocol: {protocol}, Ports: {from_port}-{to_port}, CIDR: {cidr}\n"
+                  
+                  if v['Remediated']:
+                      message += f"   ✅ Status: OPEN RULES REVOKED\n"
+                  elif v.get('Whitelisted'):
+                      message += f"   ⚪ Status: WHITELISTED (Tag: Name=testing) - Not remediated\n"
+                  elif 'RemediationError' in v:
+                      message += f"   ⚠️  Status: REMEDIATION FAILED - {v['RemediationError']}\n"
+                  else:
+                      message += f"   ⚠️  Status: DETECTED (Auto-remediation disabled)\n"
+              
+              message += f"\n\nRecommendation: Review security group configurations and ensure proper access controls.\n"
+              
+              return message
+
+  # Lambda for Initial Scan on Deployment
+  InitialScanFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableInitialScan
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityMonitorRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityAlertTopic
+          AUTO_REMEDIATE: !Ref AutoRemediate
+      Tags:
+        - Key: Name
+          Value: do-not-delete
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: SecurityGroupMonitoring
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+
+          ec2 = boto3.client('ec2')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              auto_remediate = os.environ['AUTO_REMEDIATE'].lower() == 'true'
+              
+              violations = []
+              
+              try:
+                  # Scan ALL security groups with pagination for speed
+                  paginator = ec2.get_paginator('describe_security_groups')
+                  page_iterator = paginator.paginate()
+                  
+                  for page in page_iterator:
+                      for sg in page['SecurityGroups']:
+                          sg_id = sg['GroupId']
+                          sg_name = sg['GroupName']
+                          vpc_id = sg.get('VpcId', 'EC2-Classic')
+                          
+                          # Check if SG is whitelisted via tag (case-insensitive)
+                          is_whitelisted = False
+                          for tag in sg.get('Tags', []):
+                              if tag.get('Key', '').lower() == 'name' and tag.get('Value', '').lower() == 'testing':
+                                  is_whitelisted = True
+                                  break
+                          
+                          # Check for open ingress rules and revoke them
+                          rules_to_revoke = []
+                          revoked_rules = []
+                          
+                          for rule in sg.get('IpPermissions', []):
+                              # Check for 0.0.0.0/0
+                              open_ipv4 = [ip for ip in rule.get('IpRanges', []) if ip.get('CidrIp') == '0.0.0.0/0']
+                              # Check for ::/0
+                              open_ipv6 = [ip for ip in rule.get('Ipv6Ranges', []) if ip.get('CidrIpv6') == '::/0']
+                              
+                              if open_ipv4 or open_ipv6:
+                                  from_port = rule.get('FromPort', 'All')
+                                  to_port = rule.get('ToPort', 'All')
+                                  protocol = rule.get('IpProtocol', 'All')
+                                  
+                                  # Build rule to revoke (only the open CIDRs)
+                                  revoke_rule = {
+                                      'IpProtocol': rule.get('IpProtocol', '-1')
+                                  }
+                                  
+                                  if 'FromPort' in rule:
+                                      revoke_rule['FromPort'] = rule['FromPort']
+                                  if 'ToPort' in rule:
+                                      revoke_rule['ToPort'] = rule['ToPort']
+                                  
+                                  if open_ipv4:
+                                      revoke_rule['IpRanges'] = open_ipv4
+                                  if open_ipv6:
+                                      revoke_rule['Ipv6Ranges'] = open_ipv6
+                                  
+                                  rules_to_revoke.append(revoke_rule)
+                                  
+                                  # Track for reporting
+                                  for ip in open_ipv4:
+                                      revoked_rules.append({
+                                          'Protocol': protocol,
+                                          'FromPort': from_port,
+                                          'ToPort': to_port,
+                                          'CIDR': '0.0.0.0/0'
+                                      })
+                                  
+                                  for ip in open_ipv6:
+                                      revoked_rules.append({
+                                          'Protocol': protocol,
+                                          'FromPort': from_port,
+                                          'ToPort': to_port,
+                                          'CIDR': '::/0'
+                                      })
+                          
+                          if revoked_rules:
+                              violation = {
+                                  'SecurityGroupId': sg_id,
+                                  'SecurityGroupName': sg_name,
+                                  'VpcId': vpc_id,
+                                  'OpenRules': revoked_rules,
+                                  'Remediated': False,
+                                  'Whitelisted': is_whitelisted
+                              }
+                              
+                              # Attempt to revoke open rules if auto-remediate is enabled AND not whitelisted
+                              if auto_remediate and rules_to_revoke and not is_whitelisted:
+                                  try:
+                                      ec2.revoke_security_group_ingress(
+                                          GroupId=sg_id,
+                                          IpPermissions=rules_to_revoke
+                                      )
+                                      violation['Remediated'] = True
+                                      print(f"Revoked open rules from security group: {sg_id}")
+                                  except Exception as e:
+                                      violation['RemediationError'] = str(e)
+                                      print(f"Failed to revoke rules from {sg_id}: {str(e)}")
+                              elif is_whitelisted:
+                                  print(f"Skipping whitelisted security group: {sg_id}")
+                              
+                              violations.append(violation)
+                  
+                  # Send SNS notification
+                  if violations:
+                      message = format_alert_message(violations, auto_remediate, scan_type='Initial Scan')
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f'🔍 Initial Scan: {len(violations)} Open CIDR Rules Found',
+                          Message=message
+                      )
+                      print(f"Alert sent for {len(violations)} violations")
+                  else:
+                      # Send all-clear notification
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject='✅ Initial Scan: No Open CIDR Rules Found',
+                          Message=f'Initial security group scan completed at {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}.\n\nNo security groups with open rules (0.0.0.0/0 or ::/0) were found.'
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Initial scan complete. Found {len(violations)} violations.',
+                          'violations': violations
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Error during initial security group scan: {str(e)}"
+                  print(error_message)
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject='❌ Security Monitor Error (Initial Scan)',
+                      Message=error_message
+                  )
+                  raise
+
+          def format_alert_message(violations, auto_remediate, scan_type='Initial Scan'):
+              timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+              
+              # Determine actual action based on what happened
+              remediated_count = sum(1 for v in violations if v.get('Remediated'))
+              whitelisted_count = sum(1 for v in violations if v.get('Whitelisted'))
+              
+              if remediated_count > 0 and whitelisted_count > 0:
+                  action = "MIXED (Some remediated, some whitelisted)"
+              elif remediated_count > 0:
+                  action = "REMEDIATED"
+              elif whitelisted_count > 0:
+                  action = "DETECTED (Whitelisted)"
+              elif auto_remediate:
+                  action = "DETECTED (Remediation failed)"
+              else:
+                  action = "DETECTED (Auto-remediation disabled)"
+              
+              message = f"""
+          Security Group Compliance Alert ({scan_type})
+          ================================
+          Timestamp: {timestamp}
+          Action: {action}
+          Total Violations: {len(violations)}
+
+          Details:
+          --------
+          """
+              
+              for i, v in enumerate(violations, 1):
+                  message += f"\n{i}. Security Group: {v['SecurityGroupName']} ({v['SecurityGroupId']})\n"
+                  message += f"   VPC: {v['VpcId']}\n"
+                  message += f"   Open Rules Detected:\n"
+                  
+                  for rule in v['OpenRules']:
+                      protocol = rule['Protocol']
+                      from_port = rule.get('FromPort', 'All')
+                      to_port = rule.get('ToPort', 'All')
+                      cidr = rule.get('CIDR', '0.0.0.0/0')
+                      message += f"     - Protocol: {protocol}, Ports: {from_port}-{to_port}, CIDR: {cidr}\n"
+                  
+                  if v['Remediated']:
+                      message += f"   ✅ Status: OPEN RULES REVOKED\n"
+                  elif v.get('Whitelisted'):
+                      message += f"   ⚪ Status: WHITELISTED (Tag: Name=testing) - Not remediated\n"
+                  elif 'RemediationError' in v:
+                      message += f"   ⚠️  Status: REMEDIATION FAILED - {v['RemediationError']}\n"
+                  else:
+                      message += f"   ⚠️  Status: DETECTED (Auto-remediation disabled)\n"
+              
+              message += f"\n\nRecommendation: Review security group configurations and ensure proper access controls.\n"
+              
+              return message
+
+  # Custom Resource Lambda to trigger initial scan (non-blocking)
+  TriggerInitialScanFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableInitialScan
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt TriggerScanRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          SCAN_FUNCTION_ARN: !GetAtt InitialScanFunction.Arn
+      Tags:
+        - Key: Name
+          Value: do-not-delete
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: SecurityGroupMonitoring
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          
+          lambda_client = boto3.client('lambda')
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Trigger scan asynchronously (non-blocking)
+                  scan_function_arn = os.environ['SCAN_FUNCTION_ARN']
+                  lambda_client.invoke(
+                      FunctionName=scan_function_arn,
+                      InvocationType='Event'  # Async invocation
+                  )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Initial scan triggered'})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Trigger failed but continuing'})
+
+  # IAM Role for Trigger Lambda
+  TriggerScanRole:
+    Type: AWS::IAM::Role
+    Condition: EnableInitialScan
+    Properties:
+      RoleName: !Sub 'SecurityGroupTriggerRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeScanFunction
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt InitialScanFunction.Arn
+
+  # Custom Resource to trigger initial scan on deployment
+  InitialScanTrigger:
+    Type: Custom::InitialScan
+    Condition: EnableInitialScan
+    Properties:
+      ServiceToken: !GetAtt TriggerInitialScanFunction.Arn
+      TriggerTime: !Ref AWS::StackId
+
+  # CloudWatch Log Group for Trigger Lambda
+  TriggerScanLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableInitialScan
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TriggerInitialScanFunction}'
+      RetentionInDays: 7
+
+  # CloudWatch Log Group for Initial Scan
+  InitialScanLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableInitialScan
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${InitialScanFunction}'
+      RetentionInDays: 7
+
+  # EventBridge Rule for Real-time Security Group Changes
+  SecurityGroupEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggers on security group creation, modification, or tag deletion
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - AuthorizeSecurityGroupEgress
+            - CreateSecurityGroup
+            - ModifySecurityGroupRules
+            - DeleteTags
+      Targets:
+        - Arn: !GetAtt SecurityGroupMonitorFunction.Arn
+          Id: SecurityGroupMonitorTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityGroupMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityGroupEventRule.Arn
+  
+  # Permission for manual invocation (for testing)
+  LambdaManualInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityGroupMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: !Ref AWS::AccountId
+  
+  # CloudTrail for EventBridge (required for API call events)
+  SecurityMonitorTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: false
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          IncludeManagementEvents: true
+          DataResources: []
+      Tags:
+        - Key: Name
+          Value: do-not-delete
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: SecurityGroupMonitoring
+  
+  # S3 Bucket for CloudTrail logs
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'security-monitor-trail-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: Name
+          Value: do-not-delete
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: SecurityGroupMonitoring
+  
+  # S3 Bucket Policy for CloudTrail
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${TrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  # CloudWatch Log Group
+  SecurityMonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SecurityGroupMonitorFunction}'
+      RetentionInDays: 7
+
+Conditions:
+  EnableInitialScan: !Equals [!Ref RunInitialScan, 'true']
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the security monitor Lambda function
+    Value: !GetAtt SecurityGroupMonitorFunction.Arn
+    Export:
+      Name: SecurityGroupMonitorFunctionArn
+  
+  SNSTopicArn:
+    Description: ARN of the SNS alert topic
+    Value: !Ref SecurityAlertTopic
+    Export:
+      Name: SecurityGroupAlertTopicArn
+  
+  CloudTrailName:
+    Description: CloudTrail for monitoring security group changes
+    Value: !Ref SecurityMonitorTrail
+  
+  TrailBucketName:
+    Description: S3 bucket for CloudTrail logs
+    Value: !Ref TrailBucket
+  
+  InitialScanFunctionArn:
+    Description: ARN of the initial scan Lambda function
+    Condition: EnableInitialScan
+    Value: !GetAtt InitialScanFunction.Arn
